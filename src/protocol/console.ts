@@ -6,7 +6,6 @@ import {
   CommandMessage,
   ConfirmedFrame,
   DEFAULT_ACK_TIMEOUT_MS,
-  FailAckMessage,
   PendingCommand,
   SessionRecord,
   Ack,
@@ -156,10 +155,13 @@ export function expirePending(
 
 /**
  * 处理观众窗回传的确认。
- * 只接受“当前未决命令、相同序号”的确认：
- *   - 旧确认（序号 <= 权威序号或与未决序号不符）一律忽略，画面不会跳回旧星图；
- *   - ok：权威画面前进到该序号；
- *   - 失败：未决标记 failed，权威画面（最后成功页）不变。
+ * 只接受“当前未决命令、相同序号、相同目标画面”的确认：
+ *   - 旧确认（与未决序号不符）一律忽略，画面不会跳回旧星图；
+ *   - 序号相同但 page/blackout 与当前 pending.target 不符（典型：多观众窗交错、
+ *     失败后序号被新命令复用，迟到确认指向旧目标）一律忽略，权威状态绝不被
+ *     不匹配当前目标的确认推进；
+ *   - ok 且目标一致：权威画面前进到该序号；
+ *   - 失败且目标一致：未决标记 failed，权威画面（最后成功页）不变。
  */
 export function receiveAck(session: SessionRecord, ack: Ack): SessionRecord {
   if (ack.sessionId !== session.sessionId) return session;
@@ -167,9 +169,21 @@ export function receiveAck(session: SessionRecord, ack: Ack): SessionRecord {
   if (!p || ack.seq !== p.seq) return session;
 
   if (!ack.ok) {
-    const reason = (ack as FailAckMessage).reason;
-    void reason;
+    // 失败确认必须针对当前未决的目标画面（其 page/blackout 是回退后的最后成功帧，
+    // 不是尝试目标，因此比对显式携带的 target）。多窗交错或失败后序号被新命令
+    // 复用时，指向旧目标的迟到失败确认一律忽略。
+    if (
+      ack.target.page !== p.target.page ||
+      ack.target.blackout !== p.target.blackout
+    ) {
+      return session;
+    }
     return { ...session, pending: { ...p, status: 'failed' } };
+  }
+
+  // 成功确认回报的就是实际呈现的画面，必须与当前未决目标完全一致。
+  if (ack.page !== p.target.page || ack.blackout !== p.target.blackout) {
+    return session;
   }
 
   const confirmed: ConfirmedFrame = {

@@ -9,7 +9,7 @@
 | --- | --- | --- |
 | `CMD` | 控制台 → 观众窗 | `sessionId`, `seq`, `action`, `page`, `blackout` |
 | `ACK` (`ok:true`) | 观众窗 → 控制台 | `sessionId`, `seq`, 实际呈现的 `page`/`blackout` |
-| `ACK` (`ok:false`) | 观众窗 → 控制台 | `reason:'IMAGE_FAILED'`，带回最后成功页 `page`/`blackout` |
+| `ACK` (`ok:false`) | 观众窗 → 控制台 | `reason:'IMAGE_FAILED'`、本次尝试的 `target{page,blackout}`、回退后实际停留的 `page`/`blackout` |
 | `SNAPSHOT_REQ` | 观众窗 → 控制台 | `viewerId`（启动/刷新后立即发，并每秒轮询直到拿到运行中会话） |
 | `SNAPSHOT_RES` | 控制台 → 观众窗 | 定向 `viewerId`、`running`、`confirmed{seq,page,blackout}`、`pending` |
 | `SESSION_ENDED` | 控制台 → 观众窗 | `sessionId` |
@@ -31,8 +31,13 @@
   只能显式**重试且沿用原序号**）；
 - `failed` 允许被讲解员的下一条命令取代（观众窗已回退到最后成功帧，新命令
   仍从上一权威序号递增），坏图不锁死放映；
-- 控制台只接受 `sessionId` 相同且 `seq === pending.seq` 的 ACK。旧确认、
-  其它会话确认一律丢弃——权威画面不可能被迟到确认拉回。
+- 控制台只接受“当前未决命令”的确认——除 `sessionId` 相同、`seq === pending.seq`
+  外，**画面也必须与 `pending.target` 完全一致**：
+  - 成功 ACK 的 `page/blackout` 必须等于目标；
+  - 失败 ACK 比对其显式携带的 `target`（其 `page/blackout` 是回退后的最后成功帧，
+    不是尝试目标）。
+  多观众窗交错、失败后同序号被替代命令复用时，迟到确认即使序号相同，只要画面
+  不匹配当前目标也一律丢弃——权威不可能被“同序号不同画面”的确认拉走。
 
 ## 观众窗不变量
 
@@ -42,12 +47,20 @@
   （含遮黑状态）。
 - `live` 期间：
   - `seq < appliedSeq`：更旧消息，忽略；
-  - `seq === appliedSeq`：完全重复（典型：ACK 丢失后超时重发），画面不动，
-    重放当前帧 ACK；
-  - `seq === appliedSeq + 1`：接受并呈现；
+  - `seq === appliedSeq` 且**无未决呈现**：完全重复（典型：ACK 丢失后超时重发），
+    画面不动，重放当前帧 ACK；若该序号正处于异步呈现（`inFlight`）则连 ACK 都不发
+    （未决呈现自身会回报，避免重放出指向旧画面的确认）；
+  - `seq === appliedSeq + 1`：接受并把目标记入 `inFlight`，开始呈现；
   - 其它跳号：忽略。
-- 呈现失败：`appliedSeq` 与画面回退到最后成功帧，回 `ok:false`；随后同序号
-  重试可再次被接受。
+- 渲染结果回调必须与当前 `inFlight`（`seq+page+blackout`）完全一致才提交，
+  否则一律丢弃：旧命令、旧快照、旧失败回退的迟到结果不改状态、不发确认。
+- 呈现失败：`appliedSeq` 与画面回退到最后成功帧，失败 ACK 携带**尝试目标**
+  `target` 与实际停留画面，回 `ok:false`；随后同序号重试可再次被接受。
+- **画面代次（epoch）**：每次有效画面来源切换（进入恢复/快照恢复/接受新命令/
+  停映）都使旧代次作废。取 Blob、解码、缩放重绘、失败回退等一切异步绘制，在真正
+  落到 Canvas 前必须仍是当前代次且仍是当前 `inFlight`/当前帧，否则丢弃。
+  因此旧快照、窗口缩放触发的旧帧重绘、失败后的旧回退、停映前的迟到结果都不可能
+  再改动画布；停映后持续黑屏。
 - `sessionId` 不匹配的任何消息（含伪造的 `CMD`/`SESSION_ENDED`）一律无效。
 
 ## 持久化与恢复

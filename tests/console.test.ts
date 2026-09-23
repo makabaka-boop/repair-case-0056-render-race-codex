@@ -155,6 +155,7 @@ describe('控制台状态机：序号与权威画面', () => {
       viewerId: 'v1',
       ok: false,
       reason: 'IMAGE_FAILED',
+      target: { page: 1, blackout: false },
       page: 0,
       blackout: false
     };
@@ -229,6 +230,7 @@ describe('控制台状态机：序号与权威画面', () => {
       viewerId: 'v1',
       ok: false,
       reason: 'IMAGE_FAILED',
+      target: { page: 1, blackout: false },
       page: 0,
       blackout: false
     });
@@ -238,6 +240,94 @@ describe('控制台状态机：序号与权威画面', () => {
     expect(r.command?.seq).toBe(1);
     expect(r.command?.page).toBe(2);
     expect(r.session.pending?.status).toBe('pending');
+  });
+
+  it('同序号但画面不匹配的成功确认不推进权威状态（多观众窗交错）', () => {
+    let s = fresh();
+    s = issue(s, { type: 'goto', page: 3 }, 1000).session;
+    // 另一观众窗迟到回报同序号、但画面是第 2 页（或遮黑状态不符）
+    const mismatched = receiveAck(s, {
+      kind: 'ACK',
+      sessionId: s.sessionId,
+      seq: 1,
+      viewerId: 'v-other',
+      ok: true,
+      page: 2,
+      blackout: false
+    });
+    expect(mismatched).toBe(s);
+    expect(mismatched.lastConfirmed).toEqual({ seq: 0, page: 0, blackout: false });
+    expect(mismatched.pending?.status).toBe('pending');
+
+    const blackoutMismatch = receiveAck(s, {
+      kind: 'ACK',
+      sessionId: s.sessionId,
+      seq: 1,
+      viewerId: 'v-other',
+      ok: true,
+      page: 3,
+      blackout: true
+    });
+    expect(blackoutMismatch).toBe(s);
+
+    // 画面完全匹配的确认仍正常推进
+    const matched = receiveAck(s, {
+      kind: 'ACK',
+      sessionId: s.sessionId,
+      seq: 1,
+      viewerId: 'v1',
+      ok: true,
+      page: 3,
+      blackout: false
+    });
+    expect(matched.lastConfirmed).toEqual({ seq: 1, page: 3, blackout: false });
+    expect(matched.pending).toBeNull();
+  });
+
+  it('失败后同序号被替代命令接管时，旧目标的迟到失败确认无效', () => {
+    let s = fresh();
+    s = issue(s, { type: 'next' }, 1000).session; // seq=1 -> 第 2 页
+    s = receiveAck(s, {
+      kind: 'ACK',
+      sessionId: s.sessionId,
+      seq: 1,
+      viewerId: 'v1',
+      ok: false,
+      reason: 'IMAGE_FAILED',
+      target: { page: 1, blackout: false },
+      page: 0,
+      blackout: false
+    });
+    // 替代命令复用 seq=1，目标改为第 3 页
+    s = issue(s, { type: 'goto', page: 2 }, 2000).session;
+    // 旧失败回退路径迟到、仍指向第 2 页的失败确认：不得把新未决标成 failed
+    const staleFail = receiveAck(s, {
+      kind: 'ACK',
+      sessionId: s.sessionId,
+      seq: 1,
+      viewerId: 'v1',
+      ok: false,
+      reason: 'IMAGE_FAILED',
+      target: { page: 1, blackout: false },
+      page: 0,
+      blackout: false
+    });
+    expect(staleFail).toBe(s);
+    expect(staleFail.pending?.status).toBe('pending');
+    expect(staleFail.pending?.target).toEqual({ page: 2, blackout: false });
+
+    // 旧目标迟到的“成功”确认同样无效
+    const staleOk = receiveAck(s, {
+      kind: 'ACK',
+      sessionId: s.sessionId,
+      seq: 1,
+      viewerId: 'v1',
+      ok: true,
+      page: 1,
+      blackout: false
+    });
+    expect(staleOk).toBe(s);
+    expect(staleOk.lastConfirmed.seq).toBe(0);
   });
 
   it('未确认（非失败）期间仍拒绝叠加新命令，必须显式重试同序号', () => {

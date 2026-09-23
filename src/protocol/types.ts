@@ -89,6 +89,8 @@ export interface FailAckMessage {
   viewerId: string;
   ok: false;
   reason: 'IMAGE_FAILED';
+  /** 该失败确认所尝试呈现的目标画面；控制台必须与当前 pending.target 完全一致才接受。 */
+  target: { page: number; blackout: boolean };
   /** 呈现失败时观众窗实际仍停留的画面（最后成功页）。 */
   page: number;
   blackout: boolean;

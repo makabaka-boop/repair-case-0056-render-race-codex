@@ -129,7 +129,8 @@ describe('观众窗：重复/重发消息', () => {
     let a = receiveCommand(v, cmd(1, 1));
     expect(a.render?.seq).toBe(1);
     const rendered = resolveRender(a.state, a.render!, true);
-    v = rendered.state;
+    expect(rendered).not.toBeNull();
+    v = rendered!.state;
     expect(v.frame).toEqual({ seq: 1, page: 1, blackout: false });
     // 控制台重发同一条
     const dup = receiveCommand(v, cmd(1, 1));
@@ -144,23 +145,101 @@ describe('观众窗：呈现失败不改变最后成功页', () => {
     let v = recovered({ seq: 2, page: 2, blackout: false });
     const a = receiveCommand(v, cmd(3, 3));
     const failed = resolveRender(a.state, a.render!, false);
-    expect(failed.ack.ok).toBe(false);
-    if (!failed.ack.ok) expect(failed.ack.reason).toBe('IMAGE_FAILED');
+    expect(failed).not.toBeNull();
+    expect(failed!.ack.ok).toBe(false);
+    if (!failed!.ack.ok) {
+      expect(failed!.ack.reason).toBe('IMAGE_FAILED');
+      // 失败确认同时携带“尝试目标”和“实际停留画面”
+      expect(failed!.ack.target).toEqual({ page: 3, blackout: false });
+      expect(failed!.ack.page).toBe(2);
+    }
     // 穹顶仍是第 2 页
-    expect(failed.state.frame).toEqual({ seq: 2, page: 2, blackout: false });
+    expect(failed!.state.frame).toEqual({ seq: 2, page: 2, blackout: false });
     // appliedSeq 回退，使同序号重试仍可被接受（appliedSeq+1）
-    expect(failed.state.appliedSeq).toBe(2);
+    expect(failed!.state.appliedSeq).toBe(2);
+    expect(failed!.state.inFlight).toBeNull();
   });
 
   it('失败后同序号重试可再次呈现并成功', () => {
     let v = recovered({ seq: 2, page: 2, blackout: false });
     let a = receiveCommand(v, cmd(3, 3));
-    a = { ...a, state: resolveRender(a.state, a.render!, false).state };
+    a = { ...a, state: resolveRender(a.state, a.render!, false)!.state };
     const retry = receiveCommand(a.state, cmd(3, 3));
     expect(retry.render?.seq).toBe(3);
-    const ok = resolveRender(retry.state, retry.render!, true);
+    const ok = resolveRender(retry.state, retry.render!, true)!;
     expect(ok.ack.ok).toBe(true);
     expect(ok.state.frame?.page).toBe(3);
+  });
+});
+
+describe('观众窗：异步呈现的代次/未决保护', () => {
+  it('命令被接受后记入 inFlight，成功回调后清空', () => {
+    const v = recovered({ seq: 1, page: 1, blackout: false });
+    const a = receiveCommand(v, cmd(2, 2));
+    expect(a.state.inFlight).toEqual({ seq: 2, page: 2, blackout: false });
+    const done = resolveRender(a.state, a.render!, true)!;
+    expect(done.state.inFlight).toBeNull();
+    expect(done.state.frame).toEqual({ seq: 2, page: 2, blackout: false });
+  });
+
+  it('旧呈现的迟到成功结果（seq/目标与当前 inFlight 不符）被丢弃', () => {
+    let v = recovered({ seq: 0, page: 0, blackout: false });
+    // seq=1 去第 2 页，解码迟迟未完成
+    let a = receiveCommand(v, cmd(1, 1));
+    const stale = a.render!;
+    // 该呈现失败回退，替代命令复用 seq=1 改去第 3 页
+    const failed = resolveRender(a.state, stale, false)!;
+    v = failed.state;
+    a = receiveCommand(v, cmd(1, 2));
+    v = a.state;
+    // 旧解码晚于替代命令完成并回报旧目标：必须无效
+    const late = resolveRender(v, stale, true);
+    expect(late).toBeNull();
+    expect(v.frame).toEqual({ seq: 0, page: 0, blackout: false });
+    expect(v.inFlight).toEqual({ seq: 1, page: 2, blackout: false });
+    // 当前目标正常完成
+    const ok = resolveRender(v, v.inFlight!, true)!;
+    expect(ok.state.frame).toEqual({ seq: 1, page: 2, blackout: false });
+  });
+
+  it('旧呈现的迟到失败结果同样被丢弃，不产生失败确认', () => {
+    let v = recovered({ seq: 0, page: 0, blackout: false });
+    let a = receiveCommand(v, cmd(1, 1));
+    const stale = a.render!;
+    v = resolveRender(a.state, stale, false)!.state;
+    a = receiveCommand(v, cmd(1, 2));
+    v = a.state;
+    // 旧路径又迟到一个失败（针对第 2 页）
+    expect(resolveRender(v, stale, false)).toBeNull();
+    expect(v.inFlight).toEqual({ seq: 1, page: 2, blackout: false });
+  });
+
+  it('呈现进行中收到同序号重发不重放 ACK（由未决呈现自身回报）', () => {
+    const v = recovered({ seq: 1, page: 1, blackout: false });
+    const a = receiveCommand(v, cmd(2, 2));
+    expect(a.state.inFlight).not.toBeNull();
+    const dup = receiveCommand(a.state, cmd(2, 2));
+    expect(dup.render).toBeNull();
+    expect(dup.resendAck).toBeNull();
+  });
+
+  it('无未决呈现时同序号重复命令仍重放当前帧 ACK', () => {
+    let v = recovered({ seq: 2, page: 2, blackout: true });
+    v = { ...v, inFlight: null };
+    const dup = receiveCommand(v, { ...cmd(2, 2), blackout: true });
+    expect(dup.resendAck?.ok).toBe(true);
+    expect(dup.resendAck?.seq).toBe(2);
+    expect(dup.resendAck?.blackout).toBe(true);
+  });
+
+  it('SESSION_ENDED 清空 inFlight：停映前的迟到结果无法再提交', () => {
+    let v = recovered({ seq: 1, page: 1, blackout: false });
+    const a = receiveCommand(v, cmd(2, 2));
+    expect(a.state.inFlight).not.toBeNull();
+    v = receiveWire(a.state, { kind: 'SESSION_ENDED', sessionId: SESSION });
+    expect(v.phase).toBe('ended');
+    expect(v.inFlight).toBeNull();
+    expect(resolveRender(v, { seq: 2, page: 2, blackout: false }, true)).toBeNull();
   });
 });
 
