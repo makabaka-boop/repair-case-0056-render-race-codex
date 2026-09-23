@@ -156,8 +156,11 @@ export function expirePending(
 
 /**
  * 处理观众窗回传的确认。
- * 只接受“当前未决命令、相同序号”的确认：
+ * 只接受“当前未决命令、相同序号、且回传画面与命令目标完全一致”的成功确认：
  *   - 旧确认（序号 <= 权威序号或与未决序号不符）一律忽略，画面不会跳回旧星图；
+ *   - 序号相同但 page/blackout 与待确认目标不同（如多观众窗交错时另一窗口
+ *     回传的同序号旧画面）同样忽略：序号只解决新旧，不证明画面就是当前目标，
+ *     权威状态只能由真正呈现了目标画面的确认推进；
  *   - ok：权威画面前进到该序号；
  *   - 失败：未决标记 failed，权威画面（最后成功页）不变。
  */
@@ -170,6 +173,12 @@ export function receiveAck(session: SessionRecord, ack: Ack): SessionRecord {
     const reason = (ack as FailAckMessage).reason;
     void reason;
     return { ...session, pending: { ...p, status: 'failed' } };
+  }
+
+  // 成功确认还必须逐字段匹配当前待确认目标；多窗口交错时同序号不同画面的
+  // 确认不具备权威性，直接丢弃，等待真正呈现目标的窗口确认。
+  if (ack.page !== p.target.page || ack.blackout !== p.target.blackout) {
+    return session;
   }
 
   const confirmed: ConfirmedFrame = {

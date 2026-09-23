@@ -108,6 +108,66 @@ describe('控制台状态机：序号与权威画面', () => {
     expect(other.lastConfirmed.seq).toBe(0);
   });
 
+  it('同序号但 page 与待确认目标不符的 ACK（多窗交错）不推进权威状态', () => {
+    let s = fresh();
+    s = issue(s, { type: 'goto', page: 2 }, 1000).session; // pending seq=1 -> page 2
+    // 另一观众窗（或乱序窗口）回传同 seq=1 却仍是旧页 0 的确认
+    const mismatched = receiveAck(s, {
+      kind: 'ACK',
+      sessionId: s.sessionId,
+      seq: 1,
+      viewerId: 'v-other',
+      ok: true,
+      page: 0,
+      blackout: false
+    });
+    expect(mismatched).toBe(s); // 权威状态完全不动
+    expect(mismatched.lastConfirmed).toEqual({ seq: 0, page: 0, blackout: false });
+    expect(mismatched.pending?.status).toBe('pending');
+
+    // 真正呈现目标页的确认到达后才收敛
+    const ok = receiveAck(s, {
+      kind: 'ACK',
+      sessionId: s.sessionId,
+      seq: 1,
+      viewerId: 'v-real',
+      ok: true,
+      page: 2,
+      blackout: false
+    });
+    expect(ok.lastConfirmed).toEqual({ seq: 1, page: 2, blackout: false });
+    expect(ok.pending).toBeNull();
+  });
+
+  it('同序号但 blackout 与待确认目标不符的 ACK 同样无效', () => {
+    let s = fresh();
+    s = issue(s, { type: 'setBlackout', blackout: true }, 1000).session;
+    // 同序号却声称仍未遮黑：不得解除权威遮黑标记
+    const mismatched = receiveAck(s, {
+      kind: 'ACK',
+      sessionId: s.sessionId,
+      seq: 1,
+      viewerId: 'v-other',
+      ok: true,
+      page: 0,
+      blackout: false
+    });
+    expect(mismatched).toBe(s);
+    expect(mismatched.lastConfirmed.blackout).toBe(false); // 权威未前进
+    expect(mismatched.pending?.status).toBe('pending');
+
+    const ok = receiveAck(s, {
+      kind: 'ACK',
+      sessionId: s.sessionId,
+      seq: 1,
+      viewerId: 'v-real',
+      ok: true,
+      page: 0,
+      blackout: true
+    });
+    expect(ok.lastConfirmed).toEqual({ seq: 1, page: 0, blackout: true });
+  });
+
   it('超时标记未确认，权威画面不变；重试沿用原序号', () => {
     let s = fresh();
     s = issue(s, { type: 'next' }, 1000).session;
